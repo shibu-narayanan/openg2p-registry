@@ -131,7 +131,7 @@ class ODKClient:
 
     def get_submissions(self, fields=None, last_sync_time=None):
         # Construct the API endpoint
-        endpoint = f"{self.base_url}/v1/projects/{self.project_id}/forms/{self.form_id}.svc/submissions"
+        endpoint = f"{self.base_url}/v1/projects/{self.project_id}/forms/{self.form_id}.svc/Submissions"
 
         # Add query parameters to fetch only specific fields and filter by last sync time
         params = {}
