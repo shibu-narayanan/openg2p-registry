@@ -1,5 +1,10 @@
 import logging
 from datetime import datetime, timedelta
+import threading
+import concurrent.futures
+from .odk_instance_id import OdkInstanceId  # Import the new model
+import traceback
+
 
 import jq
 
@@ -136,6 +141,9 @@ class OdkImport(models.Model):
     def import_records(self):
         if not self.odk_config:
             raise UserError(_("Please configure the ODK."))
+
+        enable_odk_async = self.env["ir.config_parameter"].get_param("g2p_odk_importer.enable_odk_async")
+
         for config in self:
             client = ODKClient(
                 self.env,
@@ -149,28 +157,49 @@ class OdkImport(models.Model):
                 config.json_formatter,
             )
             client.login()
-            imported = client.import_delta_records(last_sync_timestamp=config.last_sync_time)
-            if "form_updated" in imported:
-                partner_count = imported.get("partner_count", 0)
-                message = f"ODK form {partner_count} records were imported successfully."
-                types = "success"
+            if enable_odk_async:
+                print("Last Sync Time",config.last_sync_time)
+                # Fetch only instance IDs
+                instance_ids = client.get_submissions(fields='__id', last_sync_time=config.last_sync_time)
+                
+                # Store instance IDs in the database
+                for instance_id in instance_ids:
+                    print("Instance ID", instance_id)
+
+                    if isinstance(instance_id, dict) and 'instanceId' in instance_id:
+                        self.env['odk.instance.id'].create({
+                            'instance_id': instance_id["instanceId"],
+                            'odk_import_id': config.id,
+                            'status': 'pending'
+                        })
+                    else:
+                        _logger.error(f"Invalid instance_id format: {instance_id}")
+
                 config.update({"last_sync_time": fields.Datetime.now()})
-            elif "form_failed" in imported:
-                message = "ODK form import failed"
-                types = "danger"
+                self.process_pending_instances()
             else:
-                message = "No new form records were submitted."
-                types = "warning"
-                config.update({"last_sync_time": fields.Datetime.now()})
-            return {
-                "type": "ir.actions.client",
-                "tag": "display_notification",
-                "params": {
-                    "type": types,
-                    "message": message,
-                    "next": {"type": "ir.actions.act_window_close"},
-                },
-            }
+                imported = client.import_delta_records(last_sync_timestamp=config.last_sync_time)
+                if "form_updated" in imported:
+                    partner_count = imported.get("partner_count", 0)
+                    message = f"ODK form {partner_count} records were imported successfully."
+                    types = "success"
+                    config.update({"last_sync_time": fields.Datetime.now()})
+                elif "form_failed" in imported:
+                    message = "ODK form import failed"
+                    types = "danger"
+                else:
+                    message = "No new form records were submitted."
+                    types = "warning"
+                    config.update({"last_sync_time": fields.Datetime.now()})
+                return {
+                    "type": "ir.actions.client",
+                    "tag": "display_notification",
+                    "params": {
+                        "type": types,
+                        "message": message,
+                        "next": {"type": "ir.actions.act_window_close"},
+                    },
+                }
 
     def odk_import_action_trigger(self):
         for rec in self:
@@ -205,3 +234,47 @@ class OdkImport(models.Model):
                 rec.job_status = "completed"
                 rec.sudo().cron_id.unlink()
                 rec.cron_id = None
+
+    def process_pending_instances(self):
+        _logger.info("Processing the ODK Async using Job Queue")
+        batch_size = 10  # Define the batch size as per your requirement
+        pending_instance_ids = self.env['odk.instance.id'].search([('status', '=', 'pending')])
+        print("Pending Instance IDs", pending_instance_ids)
+        if not pending_instance_ids:
+            _logger.info("No pending instance IDs found.")
+            return
+
+        _logger.info(f"Found {len(pending_instance_ids)} pending instance IDs.")
+
+        for batch_start in range(0, len(pending_instance_ids), batch_size):
+            batch = pending_instance_ids[batch_start:batch_start + batch_size]
+            _logger.info(f"Submitting batch of {len(batch)} instance IDs.")
+            self.with_delay()._process_instance_id(batch)
+
+    
+    def _process_instance_id(self, instance_ids):
+        for instance_id in instance_ids:
+            _logger.info("Processing instance ID", instance_id.instance_id)
+            instance_id.sudo().status = 'processing'
+            client = ODKClient(
+                self.env,
+                instance_id.odk_import_id.id,
+                instance_id.odk_import_id.odk_config.base_url,
+                instance_id.odk_import_id.odk_config.username,
+                instance_id.odk_import_id.odk_config.password,
+                instance_id.odk_import_id.odk_config.project,
+                instance_id.odk_import_id.odk_config.form_id,
+                instance_id.odk_import_id.target_registry,
+                instance_id.odk_import_id.json_formatter,
+            )
+            print("ODK Client", client.id)
+            client.login()
+            try:
+                client.import_record_by_instance_id(instance_id.instance_id)
+                print("ODK imported")
+                instance_id.sudo().write({'status' : 'processing'})
+                print("Instance ID processed", instance_id)
+            except Exception as exc:
+                _logger.error(traceback.format_exc())
+                _logger.error(f"Failed to import instance ID {instance_id.instance_id}: {exc}")
+                instance_id.sudo().write({'status' : 'failed'})
